@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+Apply ai-cleanup/* labels to Gmail via gws — run by the AGENT, in the sandbox.
+
+Ported from agent/bin/apply-labels. The difference in the agent-first design:
+this runs *inside* the Hermes container, so every gws call traverses the
+gateway, which is the real trust boundary. The allowlist check here is
+belt-and-suspenders — the gateway independently rejects any label outside
+ai-cleanup/*, so even a tampered copy of this script can't mutate anything else.
+
+Reads:
+- BATCH/heuristic-decisions.json — pre-decided by the host pre-filter
+- BATCH/proposals.json           — written by the agent this run
+Validates against the ai-cleanup/* allowlist + candidates.ndjson IDs, creates
+the labels if missing, then batchModify-adds them. Writes applied.json /
+rejected.json into the batch dir.
+
+Usage:
+    apply-labels --run-dir BATCH_DIR [--dry-run]
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+GWS = os.environ.get("GWS", "gws")  # on PATH in the container (proxy-fronted)
+ALLOWED_LABELS = {"ai-cleanup/trash?", "ai-cleanup/archive?", "ai-cleanup/unsubscribe?"}
+BATCH_SIZE = 1000
+
+
+def gws_call(*args, params, body=None):
+    cmd = [GWS, *args, "--params", json.dumps(params)]
+    if body is not None:
+        cmd += ["--json", json.dumps(body)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, r.stderr.strip()
+    if not r.stdout.strip():
+        return {}, None  # HTTP 204 (batchModify success) → empty body
+    try:
+        return json.loads(r.stdout), None
+    except json.JSONDecodeError as e:
+        return None, f"parse: {e}; {r.stdout[:200]}"
+
+
+def ensure_labels(allowed):
+    data, err = gws_call("gmail", "users", "labels", "list", params={"userId": "me"})
+    if data is None:
+        print(f"[error] list labels: {err}", file=sys.stderr)
+        sys.exit(2)
+    existing = {l["name"]: l["id"] for l in data.get("labels", [])}
+    name_to_id = {}
+    for name in allowed:
+        if name in existing:
+            name_to_id[name] = existing[name]
+            continue
+        data, err = gws_call(
+            "gmail", "users", "labels", "create",
+            params={"userId": "me"},
+            body={"name": name, "labelListVisibility": "labelShow",
+                  "messageListVisibility": "show"},
+        )
+        if data is None:
+            print(f"[error] create label {name!r}: {err}", file=sys.stderr)
+            sys.exit(2)
+        name_to_id[name] = data["id"]
+        print(f"  created label {name!r} -> {data['id']}", file=sys.stderr)
+    return name_to_id
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    run_dir = Path(args.run_dir)
+
+    pending, rejected = [], []
+
+    heur_path = run_dir / "heuristic-decisions.json"
+    if heur_path.exists():
+        for d in json.loads(heur_path.read_text()).get("decisions", []):
+            lab = d.get("label")
+            if lab not in ALLOWED_LABELS:
+                rejected.append({"source": "heuristic", "id": d.get("id"),
+                                 "label": lab, "why": "label not in allowlist"})
+                continue
+            pending.append({"id": d["id"], "label": lab, "source": "heuristic",
+                            "rule": d.get("rule")})
+
+    candidate_ids = set()
+    cand_path = run_dir / "candidates.ndjson"
+    if cand_path.exists():
+        with cand_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    candidate_ids.add(json.loads(line)["id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+    prop_path = run_dir / "proposals.json"
+    if prop_path.exists():
+        for p in json.loads(prop_path.read_text()).get("proposals", []):
+            lab, mid = p.get("label"), p.get("id")
+            if not isinstance(lab, str) or not isinstance(mid, str):
+                rejected.append({"source": "agent", "id": mid, "label": lab,
+                                 "why": "missing/invalid id or label"})
+                continue
+            if lab not in ALLOWED_LABELS:
+                rejected.append({"source": "agent", "id": mid, "label": lab,
+                                 "why": "label not in allowlist"})
+                continue
+            if candidate_ids and mid not in candidate_ids:
+                rejected.append({"source": "agent", "id": mid, "label": lab,
+                                 "why": "id not in candidates.ndjson"})
+                continue
+            pending.append({"id": mid, "label": lab, "source": "agent",
+                            "reason": p.get("reason")})
+    else:
+        print(f"[warn] no proposals.json at {prop_path}", file=sys.stderr)
+
+    if rejected:
+        (run_dir / "rejected.json").write_text(json.dumps({"rejected": rejected}, indent=2))
+        print(f"[warn] {len(rejected)} rejected (see rejected.json)", file=sys.stderr)
+
+    by_label = {}
+    for p in pending:
+        by_label.setdefault(p["label"], []).append(p["id"])
+    print("Pending applications:", file=sys.stderr)
+    for lab, ids in by_label.items():
+        print(f"  {lab}: {len(ids)}", file=sys.stderr)
+
+    if args.dry_run:
+        (run_dir / "applied.json").write_text(json.dumps(
+            {"dry_run": True, "would_apply": {l: len(i) for l, i in by_label.items()},
+             "details": pending}, indent=2))
+        print("[dry-run] no Gmail changes made.", file=sys.stderr)
+        return 0
+
+    if not by_label:
+        (run_dir / "applied.json").write_text(json.dumps({"applied": {}, "details": []}, indent=2))
+        return 0
+
+    name_to_id = ensure_labels(ALLOWED_LABELS)
+    applied_counts, errors = {}, []
+    for label_name, ids in by_label.items():
+        label_id = name_to_id[label_name]
+        ids = list(dict.fromkeys(ids))
+        ok = 0
+        for i in range(0, len(ids), BATCH_SIZE):
+            batch = ids[i:i + BATCH_SIZE]
+            _, err = gws_call("gmail", "users", "messages", "batchModify",
+                              params={"userId": "me"},
+                              body={"ids": batch, "addLabelIds": [label_id]})
+            if err:
+                errors.append({"label": label_name, "batch_start": i, "error": err})
+                print(f"[error] {label_name} batch {i}: {err}", file=sys.stderr)
+            else:
+                ok += len(batch)
+        applied_counts[label_name] = ok
+        print(f"  applied {label_name}: {ok}/{len(ids)}", file=sys.stderr)
+
+    (run_dir / "applied.json").write_text(json.dumps(
+        {"applied": applied_counts, "errors": errors, "details": pending}, indent=2))
+    return 0 if not errors else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

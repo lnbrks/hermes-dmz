@@ -1,0 +1,26 @@
+[Unit]
+Description=Inbox cleanup agent (classification + label proposal)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Path to the agent dir — adjust if you move the repo.
+WorkingDirectory=%h/src/ai-inbox-cleanup/agent
+ExecStart=%h/src/ai-inbox-cleanup/agent/bin/cleanup-run
+# Per-run logs are written into runs/<ts>/run.log by the script.
+# Systemd journal also captures stdout/stderr.
+StandardOutput=journal
+StandardError=journal
+# Don't let a stuck run hang forever; the agent itself has its own timeout.
+TimeoutStartSec=30min
+# Hardening (outer wrapper is privileged but we still apply standard guards).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

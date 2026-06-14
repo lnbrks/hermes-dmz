@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Host side of the agent-first pipeline. Trusted; runs on the VM host (not in a
+# container) with the real gws credentials.
+#
+# 1. Fetch new inbox messages since the cursor (read-only).
+# 2. Pre-filter (idempotency, excluded domains, heuristics) into a batch dir
+#    inside the bind-mounted work dir.
+# 3. If there's anything to do, wake the agent via the Hermes webhook.
+#
+# The cursor is NOT advanced here — the agent advances it (commit-cursor) only
+# after it has applied labels, so a failed/abandoned run is safe to retry.
+#
+# Usage:
+#   host/fetch-and-trigger [--max-emails N] [--since-days N]
+set -euo pipefail
+
+MAX_EMAILS="" ; SINCE_DAYS="14"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --max-emails) MAX_EMAILS="$2"; shift 2 ;;
+    --since-days) SINCE_DAYS="$2"; shift 2 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+AGENT_BIN="$REPO/agent/bin"
+WORK="$REPO/deploy/state/work"
+CURSOR="$WORK/cursor"
+TS="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+BATCH="$WORK/batches/$TS"
+mkdir -p "$BATCH" "$CURSOR"
+
+# Load deploy/.env for the webhook secret/port.
+[[ -f "$REPO/deploy/.env" ]] && { set -a; . "$REPO/deploy/.env"; set +a; }
+WEBHOOK_PORT="${WEBHOOK_PORT:-8644}"
+WEBHOOK_URL="${WEBHOOK_URL:-http://127.0.0.1:${WEBHOOK_PORT}/webhooks/inbox-cleanup}"
+: "${WEBHOOK_SECRET:?set WEBHOOK_SECRET in deploy/.env}"
+
+echo "[fetch-and-trigger] batch $TS"
+
+# ── 1. fetch (read-only; cursor lives in $CURSOR/last-run.json) ────────────
+fetch_args=(--out "$BATCH/inbox.ndjson" --state "$CURSOR" --run-dir "$BATCH"
+            --since-days "$SINCE_DAYS")
+[[ -n "$MAX_EMAILS" ]] && fetch_args+=(--max-emails "$MAX_EMAILS")
+"$AGENT_BIN/gws-fetch" "${fetch_args[@]}"
+
+# ── 2. pre-filter ──────────────────────────────────────────────────────────
+"$AGENT_BIN/pre-filter" \
+  --in "$BATCH/inbox.ndjson" \
+  --run-dir "$BATCH" \
+  --config-dir "$REPO/agent/config" \
+  --excluded-domains "$REPO/excluded_domains.txt" \
+  --labels-file "$BATCH/labels.json"
+
+n_cand="$(wc -l < "$BATCH/candidates.ndjson" | tr -d ' ')"
+n_heur="$(python3 -c "import json;print(len(json.load(open('$BATCH/heuristic-decisions.json'))['decisions']))")"
+echo "[fetch-and-trigger] candidates=$n_cand heuristics=$n_heur"
+
+if [[ "$n_cand" -eq 0 && "$n_heur" -eq 0 ]]; then
+  echo "[fetch-and-trigger] nothing to do; not waking the agent"
+  exit 0
+fi
+
+# ── 3. fire the webhook (HMAC-SHA256 over the body) ────────────────────────
+# Hermes' generic webhook expects a BARE hex digest in X-Webhook-Signature
+# (no "sha256=" prefix). Signature computed with python (no openssl dependency).
+CONTAINER_PATH="/opt/data/work/batches/$TS"
+BODY="$(python3 -c "import json;print(json.dumps({'batch':'$TS','path':'$CONTAINER_PATH','candidates':$n_cand,'heuristics':$n_heur}))")"
+SIG="$(WEBHOOK_SECRET="$WEBHOOK_SECRET" BODY="$BODY" python3 -c 'import hmac,hashlib,os;print(hmac.new(os.environ["WEBHOOK_SECRET"].encode(),os.environ["BODY"].encode(),hashlib.sha256).hexdigest())')"
+
+echo "[fetch-and-trigger] POST $WEBHOOK_URL"
+curl -fsS -X POST "$WEBHOOK_URL" \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Signature: $SIG" \
+  -d "$BODY" && echo && echo "[fetch-and-trigger] agent woken"

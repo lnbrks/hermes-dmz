@@ -1,0 +1,3 @@
+# Secrets and runtime state — never commit.
+.env
+state/

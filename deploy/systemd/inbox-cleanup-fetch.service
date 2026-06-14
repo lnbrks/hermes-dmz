@@ -1,0 +1,12 @@
+[Unit]
+Description=Inbox cleanup: fetch new mail and wake the Hermes agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust this path if the repo lives elsewhere.
+WorkingDirectory=%h/src/ai-inbox-cleanup
+ExecStart=%h/src/ai-inbox-cleanup/host/fetch-and-trigger
+# Keep a tight timeout — fetch + pre-filter + one webhook POST is quick.
+TimeoutStartSec=600

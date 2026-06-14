@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Advance the durable cursor after a successful run. Run by the agent LAST.
+
+Promotes a batch's fetch-max watermark into the cursor file the host's next
+fetch reads. Only run this once labels have been applied — that's what makes a
+crashed/abandoned run safe to retry (the cursor doesn't move, so the host
+re-hands the same window next time).
+
+Usage:
+    commit-cursor BATCH_DIR [CURSOR_DIR]
+    # e.g. commit-cursor /opt/data/work/batches/<ts>
+"""
+import datetime
+import json
+import sys
+from pathlib import Path
+
+batch = Path(sys.argv[1])
+cursor_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("/opt/data/work/cursor")
+cursor_dir.mkdir(parents=True, exist_ok=True)
+
+fetch_max = json.loads((batch / "fetch-max.json").read_text())
+out = {
+    "max_internal_date_ms": fetch_max["max_internal_date_ms"],
+    "committed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "batch": str(batch),
+}
+(cursor_dir / "last-run.json").write_text(json.dumps(out, indent=2))
+print(f"cursor advanced -> {out['max_internal_date_ms']} ({batch.name})")

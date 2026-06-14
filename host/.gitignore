@@ -1,0 +1,3 @@
+# gws agent credential dir — encrypted creds + plaintext encryption key.
+# Never commit.
+gws_secrets/

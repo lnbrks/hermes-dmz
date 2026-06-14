@@ -1,0 +1,116 @@
+# Agent-first inbox cleanup — Hermes in a network jail behind the GWS gateway.
+#
+# Topology:
+#
+#   hermes (internal net only, NO internet)  ──HTTPS_PROXY──▶  gateway
+#                                                                 │
+#                                            (egress net, internet)│
+#                                                                 ▼
+#                                          openrouter.ai / api.telegram.org / *.googleapis.com
+#
+# The `internal: true` network has no NAT to the internet, so the only way out
+# of the hermes container is the proxy. Because hermes uses HTTPS_PROXY, it
+# never needs to resolve external names itself — the gateway does, on the
+# egress network. That's what makes the jail airtight: even proxy-unaware code
+# in the container has no route to the internet.
+
+networks:
+  egress:
+    driver: bridge          # has internet; only the gateway is attached
+  internal:
+    internal: true          # no internet; hermes + gateway only
+
+volumes:
+  mitm-ca:                  # the proxy's generated CA, shared read-only to hermes
+
+services:
+  gateway:
+    build: ./../gateway
+    image: inbox-gateway:latest
+    container_name: inbox-gateway
+    restart: unless-stopped
+    networks: [egress, internal]
+    ports:
+      # Webhook ingress: host → gateway → (socat) → hermes:8644. The gateway is
+      # on the egress bridge, so unlike hermes it CAN publish to the host.
+      - "127.0.0.1:8644:8644"
+    volumes:
+      # :z = relabel for SELinux (Fedora/RHEL); harmless on non-SELinux hosts.
+      - ./../gateway/config/allowlist.yaml:/app/config/allowlist.yaml:ro,z
+      - ./state/secrets/gws-creds.json:/run/secrets/gws-creds.json:ro,z  # authorized_user creds (real refresh token; trusted side only)
+      - mitm-ca:/home/mitmproxy/.mitmproxy    # CA + audit log live here (named volume; no relabel needed)
+    environment:
+      - GATEWAY_ALLOWLIST=/app/config/allowlist.yaml
+      - GOOGLE_REFRESH_CREDENTIALS_FILE=/run/secrets/gws-creds.json
+      - GATEWAY_AUDIT_LOG=/home/mitmproxy/.mitmproxy/audit.jsonl
+      # Real secrets live ONLY here (trusted side). The gateway swaps the
+      # sandbox's dummy credentials for these on the way upstream.
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_CHATS=${TELEGRAM_CHAT_ID}
+      # Expected dummy credentials (shared secret with the sandbox). A request
+      # that doesn't present these is denied before any real key is injected.
+      - SANDBOX_GOOGLE_TOKEN=${SANDBOX_GOOGLE_TOKEN:-dummy-sandbox-token}
+      - SANDBOX_OPENROUTER_KEY=${SANDBOX_OPENROUTER_KEY:-dummy-openrouter-key}
+      - SANDBOX_TELEGRAM_TOKEN=${SANDBOX_TELEGRAM_TOKEN:-111111:DUMMYtelegramTOKEN0000000000000000}
+    healthcheck:
+      # Pass only once the CA cert exists, so hermes (which trusts only this
+      # CA) never starts before the cert it needs is on disk.
+      test: ["CMD", "test", "-f", "/home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: inbox-hermes
+    restart: unless-stopped
+    command: gateway run
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks: [internal]                      # NO egress network → no internet
+    # No published ports: an internal-only network can't publish them. The host
+    # reaches the webhook via the container's internal IP (see host/fetch-and-trigger).
+    volumes:
+      - ./state/hermes:/opt/data:z            # hermes state (config, sessions, memory, skills)
+      - ./../hermes/config.yaml:/opt/data/config.yaml:ro,z
+      # Our skill is SEEDED into state/hermes/skills (not nested-mounted — a
+      # nested bind mount makes /opt/data/skills root-owned and unwritable).
+      # Skills live in the rw data volume; the agent can create/modify them.
+      - ./state/work:/opt/data/work:z         # batch handoff + cursor (host writes, agent reads/writes)
+      - mitm-ca:/opt/mitm-ca:ro               # the gateway's CA, to trust the MITM (named volume)
+      - ${GWS_BIN:-/home/ilana/.cargo/bin/gws}:/usr/local/bin/gws:ro,z
+    environment:
+      # Run as the host user so bind-mounted state/skills ownership lines up.
+      - HERMES_UID=1000
+      - HERMES_GID=1000
+      - PUID=1000
+      - PGID=1000
+      # ── route ALL egress through the gateway ──────────────────────────
+      - HTTP_PROXY=http://gateway:8080
+      - HTTPS_PROXY=http://gateway:8080
+      - ALL_PROXY=http://gateway:8080
+      - NO_PROXY=localhost,127.0.0.1,gateway
+      # ── trust the gateway's MITM CA (all external TLS terminates there) ─
+      - SSL_CERT_FILE=/opt/mitm-ca/mitmproxy-ca-cert.pem
+      - REQUESTS_CA_BUNDLE=/opt/mitm-ca/mitmproxy-ca-cert.pem
+      - CURL_CA_BUNDLE=/opt/mitm-ca/mitmproxy-ca-cert.pem
+      - NODE_EXTRA_CA_CERTS=/opt/mitm-ca/mitmproxy-ca-cert.pem
+      # ── DUMMY credentials only — the gateway injects the real ones ─────
+      # gws sends this dummy bearer; OpenAI client sends the dummy key;
+      # python-telegram-bot puts the dummy token in the URL path. The proxy
+      # swaps each for the real secret upstream. Nothing real is reachable here.
+      - GOOGLE_WORKSPACE_CLI_TOKEN=${SANDBOX_GOOGLE_TOKEN:-dummy-sandbox-token}
+      - GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/opt/data/gws-config
+      - OPENROUTER_API_KEY=${SANDBOX_OPENROUTER_KEY:-dummy-openrouter-key}
+      - TELEGRAM_BOT_TOKEN=${SANDBOX_TELEGRAM_TOKEN:-111111:DUMMYtelegramTOKEN0000000000000000}
+      # ── non-secret local Telegram config (PTB allowlists, home chat) ───
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
+      - TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}
+      # ── webhook trigger ────────────────────────────────────────────────
+      - WEBHOOK_ENABLED=true
+      - WEBHOOK_PORT=8644
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - HERMES_SKIP_CONFIG_MIGRATION=1

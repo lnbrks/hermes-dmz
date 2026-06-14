@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+Read-only fetch of inbox messages via gws. Writes NDJSON.
+
+Strategy:
+- "New since last run" via Gmail's `after:` query, using the previous run's
+  recorded high-water mark (max internalDate seen).
+- First run with no state: defaults to last 14 days.
+
+Usage:
+    gws-fetch --out RUN_DIR/inbox.ndjson --state STATE_DIR
+    gws-fetch --out ... --state ... --since-days 30
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+GWS = os.path.expanduser("~/.cargo/bin/gws")
+HEADERS = ["From", "Subject", "Date", "List-Unsubscribe", "List-Unsubscribe-Post"]
+
+
+class GwsError(Exception):
+    """gws CLI failed. Exit codes from gws: 2=auth, 1=API, 3=validation, etc."""
+    def __init__(self, args, returncode, stderr):
+        self.args = args
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(f"gws {' '.join(args)} failed (exit {returncode}): {stderr}")
+
+
+def gws_call(*args, params, body=None):
+    cmd = [GWS, *args, "--params", json.dumps(params)]
+    if body is not None:
+        cmd += ["--json", json.dumps(body)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise GwsError(args, r.returncode, r.stderr.strip())
+    # HTTP 204 No Content endpoints (batchModify, etc.) return empty stdout.
+    if not r.stdout.strip():
+        return {}
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        raise GwsError(args, 0, f"json parse: {e}; out: {r.stdout[:200]}")
+
+
+def list_ids(query):
+    ids, page_token, page = [], None, 0
+    while True:
+        params = {"userId": "me", "q": query, "maxResults": 500}
+        if page_token:
+            params["pageToken"] = page_token
+        data = gws_call("gmail", "users", "messages", "list", params=params)
+        ids.extend(data.get("messages", []))
+        page_token = data.get("nextPageToken")
+        page += 1
+        print(f"  page {page}: total ids={len(ids)}", file=sys.stderr)
+        if not page_token:
+            break
+    return [m["id"] for m in ids]
+
+
+def get_message(msg_id):
+    try:
+        data = gws_call(
+            "gmail", "users", "messages", "get",
+            params={"userId": "me", "id": msg_id, "format": "metadata",
+                    "metadataHeaders": HEADERS},
+        )
+    except GwsError as e:
+        # auth errors mid-stream are fatal; per-message API errors are not
+        if e.returncode == 2:
+            raise
+        print(f"[gws get {msg_id}] {e.stderr}", file=sys.stderr)
+        return None
+    headers = {h["name"]: h["value"]
+               for h in data.get("payload", {}).get("headers", [])
+               if h["name"] in HEADERS}
+    return {
+        "id": data["id"],
+        "threadId": data.get("threadId"),
+        "internalDate": data.get("internalDate"),
+        "labelIds": data.get("labelIds", []),
+        "snippet": data.get("snippet", ""),
+        "headers": headers,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True, help="path to inbox.ndjson")
+    ap.add_argument("--state", required=True, help="agent state dir (read-only)")
+    ap.add_argument("--run-dir", required=True,
+                    help="per-run dir; we write fetch-max.json and labels.json here")
+    ap.add_argument("--since-days", type=int, default=14,
+                    help="fallback lookback when no prior state (default 14)")
+    ap.add_argument("--delay", type=float, default=0.05)
+    ap.add_argument("--max-emails", type=int, default=0,
+                    help="cap fetched messages to N (newest first; 0 = unlimited)")
+    args = ap.parse_args()
+
+    state_dir = Path(args.state)
+    run_dir = Path(args.run_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / "last-run.json"
+    if state_file.exists():
+        state = json.loads(state_file.read_text())
+        last_ms = int(state.get("max_internal_date_ms", 0))
+    else:
+        last_ms = 0
+
+    # Snapshot the user's labels once per run. Downstream steps use this to
+    # resolve ai-cleanup/* names to IDs (idempotency check, label application).
+    labels_resp = gws_call("gmail", "users", "labels", "list",
+                           params={"userId": "me"})
+    label_map = {l["name"]: l["id"] for l in labels_resp.get("labels", [])}
+    (run_dir / "labels.json").write_text(json.dumps(label_map, indent=2))
+    # Computed once: the set of label IDs that mean "this run already
+    # touched this message." Used below to determine freshness without
+    # relying solely on timestamps (two messages can have the same ts).
+    cleanup_ids = {lid for name, lid in label_map.items()
+                   if name.lower().startswith("ai-cleanup/")}
+
+    # Gmail's `after:` accepts YYYY/MM/DD (day-inclusive) or an integer
+    # epoch-seconds value. We want INCLUSIVE-at-boundary semantics: include
+    # messages at exactly the watermark second so we don't lose anything
+    # delivered at the same second/millisecond as last run's latest
+    # message. Deduplication is then the pre-filter's job via Gmail labels.
+    if last_ms:
+        after_seconds = last_ms // 1000  # inclusive of the watermark second
+        dt = datetime.fromtimestamp(after_seconds, tz=timezone.utc)
+        query = f"in:inbox after:{after_seconds}"
+        print(f"fetch query: {query!r}  (>= {dt.isoformat()})", file=sys.stderr)
+    else:
+        dt = datetime.now(tz=timezone.utc) - timedelta(days=args.since_days)
+        query = f"in:inbox after:{dt.strftime('%Y/%m/%d')}"
+        print(f"fetch query: {query!r}", file=sys.stderr)
+
+    ids = list_ids(query)
+    # Gmail returns newest-first. Reverse so we process oldest-first: this
+    # keeps the watermark monotonic (any prefix of processed messages
+    # corresponds to a single cutoff in time) and makes --max-emails take
+    # the oldest unprocessed batch rather than skipping past older mail.
+    ids.reverse()
+    print(f"{len(ids)} ids available; "
+          f"target writes: {args.max_emails or 'unlimited'}", file=sys.stderr)
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ok, err, stale, new_max = 0, 0, 0, last_ms
+    with out.open("w") as f:
+        for i, mid in enumerate(ids):
+            if args.max_emails and ok >= args.max_emails:
+                break  # got N fresh writes; stop spending RPCs on the rest
+            msg = get_message(mid)
+            if msg is None:
+                err += 1
+                continue
+            ts = int(msg.get("internalDate") or 0)
+            labels_on_msg = set(msg.get("labelIds", []))
+            # Advance the watermark for ANY message we successfully fetched
+            # metadata for, fresh or stale. That way a boundary collision
+            # (e.g. several messages at exactly the same ms) won't cause us
+            # to re-fetch the stale ones forever.
+            if ts > new_max:
+                new_max = ts
+            # "Stale" = we've already processed this. Two signals:
+            #   - ts < last_ms       (definitely older than the watermark)
+            #   - any ai-cleanup/*   (we already labeled it on a prior run)
+            # The label check is the authoritative one — timestamps alone
+            # can't distinguish "two arrived at the same ms; we saw one."
+            is_stale = (ts < last_ms) or bool(labels_on_msg & cleanup_ids)
+            if is_stale:
+                stale += 1
+                continue
+            f.write(json.dumps(msg) + "\n")
+            ok += 1
+            if (i + 1) % 25 == 0:
+                print(f"  [{i+1}/{len(ids)}] ok={ok} stale={stale} err={err}",
+                      file=sys.stderr)
+            time.sleep(args.delay)
+
+    # Write the candidate high-water mark to the run dir. cleanup-run promotes
+    # this to STATE/last-run.json only after the rest of the pipeline succeeds —
+    # so a crashed run does not skip those messages on the next attempt.
+    (run_dir / "fetch-max.json").write_text(json.dumps({
+        "max_internal_date_ms": new_max,
+        "previous_max_internal_date_ms": last_ms,
+        "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+        "messages_written": ok,
+    }, indent=2))
+    print(f"wrote {ok} messages to {out} "
+          f"(stale-skipped={stale}, errors={err})", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except GwsError as e:
+        print(f"\n[gws-fetch] aborting: {e}", file=sys.stderr)
+        if e.returncode == 2:
+            print("[gws-fetch] auth error — run `gws auth login` to re-authenticate",
+                  file=sys.stderr)
+        sys.exit(2 if e.returncode == 2 else 1)

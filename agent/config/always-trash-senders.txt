@@ -1,0 +1,17 @@
+# Senders to auto-label ai-cleanup/trash? without LLM judgment.
+# Matched by domain suffix. From POLICY.md §9.
+# One per line; lines starting with # are comments.
+
+wayfair.com
+urbanoutfitters.com
+cider.com
+aritzia.com
+bnto.com
+crateandbarrel.com
+moderncitizen.com
+freepeople.com
+pepper.com
+quince.com
+
+# huel: receipts/order confirmations should be reviewed by LLM, not auto-trashed
+# so we don't add huel here; let LLM see promo vs receipt distinction

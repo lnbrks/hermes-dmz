@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Run the classification agent in a bwrap sandbox.
+#
+# The agent sees:
+#   - read-only: /prompts (system prompt, sender rules)
+#   - read-write: /run-dir (its inputs and its outputs)
+#   - read-only: minimal /usr for system libs + the claude binary
+#   - network: yes (Anthropic API). bwrap can't filter by destination; egress
+#     filtering is a v2 problem.
+#
+# It does NOT see:
+#   - any of $HOME (tmpfs)
+#   - /etc beyond resolv.conf + ssl certs
+#   - the gws binary, the gws OAuth tokens, the apply-labels script
+#   - any other repo files
+#
+# Usage:
+#   agent-run RUN_DIR PROMPTS_DIR
+#
+# Env:
+#   ANTHROPIC_API_KEY  (required) — passed through to the agent
+#   AGENT_MODEL        (default claude-sonnet-4-6)
+#   AGENT_EFFORT       (default high; options: low, medium, high, xhigh, max)
+#   AGENT_TIMEOUT_SEC  (default 600)
+
+set -euo pipefail
+
+RUN_DIR="${1:?usage: agent-run RUN_DIR PROMPTS_DIR}"
+PROMPTS_DIR="${2:?usage: agent-run RUN_DIR PROMPTS_DIR}"
+MODEL="${AGENT_MODEL:-claude-sonnet-4-6}"
+EFFORT="${AGENT_EFFORT:-high}"
+TIMEOUT="${AGENT_TIMEOUT_SEC:-600}"
+
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set}"
+
+RUN_DIR="$(realpath "$RUN_DIR")"
+PROMPTS_DIR="$(realpath "$PROMPTS_DIR")"
+
+# Persist Claude Code's transcript to the run dir so we can review the
+# agent's turns (tool calls, thinking, intermediate text) after the fact.
+# Bind-mounted into the sandbox's $HOME/.claude below.
+mkdir -p "$RUN_DIR/claude-state"
+
+# Find the real claude binary (resolve the symlink).
+CLAUDE_LINK="$(command -v claude || true)"
+if [[ -z "$CLAUDE_LINK" ]]; then
+  echo "[agent-run] claude not found on PATH" >&2
+  exit 2
+fi
+CLAUDE_BIN="$(readlink -f "$CLAUDE_LINK")"
+
+# Compose the agent's first user message: just point it at its inputs.
+# (System prompt is the meat; this is the kickoff.)
+cat > "$RUN_DIR/agent-input.md" <<EOF
+Run the inbox cleanup classification task as described in your system prompt.
+
+Working directory: /run-dir
+
+Files available to you:
+- /run-dir/candidates.ndjson       (input: emails to classify)
+- /prompts/user-context.md         (input: user's free-form natural-language context)
+
+Write your outputs to:
+- /run-dir/proposals.json
+- /run-dir/notification.md
+
+Today's date is $(date -u +%Y-%m-%d). The run timestamp is $(date -u +%Y-%m-%dT%H:%M:%SZ).
+EOF
+
+echo "[agent-run] launching claude (model=$MODEL, timeout=${TIMEOUT}s)" >&2
+
+# bwrap config:
+#   --unshare-all then --share-net selectively re-enables network only.
+#   --tmpfs /home gives an empty home; --setenv HOME /tmp uses tmpfs we already have.
+#   --new-session detaches from controlling tty.
+#   --die-with-parent kills the sandbox if we go away.
+exec timeout "$TIMEOUT" bwrap \
+  --ro-bind /usr /usr \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf \
+  --ro-bind /etc/ssl /etc/ssl \
+  --ro-bind /etc/pki /etc/pki \
+  --symlink usr/lib /lib \
+  --symlink usr/lib64 /lib64 \
+  --symlink usr/bin /bin \
+  --symlink usr/sbin /sbin \
+  --proc /proc \
+  --dev /dev \
+  --tmpfs /tmp \
+  --tmpfs /home \
+  --tmpfs /var \
+  --tmpfs /opt \
+  --ro-bind "$CLAUDE_BIN" /opt/claude \
+  --ro-bind "$PROMPTS_DIR" /prompts \
+  --bind "$RUN_DIR" /run-dir \
+  --bind "$RUN_DIR/claude-state" /tmp/.claude \
+  --chdir /run-dir \
+  --setenv HOME /tmp \
+  --setenv PATH /opt:/usr/bin \
+  --setenv ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY" \
+  --setenv TERM dumb \
+  --unshare-all \
+  --share-net \
+  --new-session \
+  --die-with-parent \
+  -- \
+  /opt/claude -p \
+    --model "$MODEL" \
+    --effort "$EFFORT" \
+    --dangerously-skip-permissions \
+    --append-system-prompt "$(cat "$PROMPTS_DIR/agent-system.md")" \
+    < "$RUN_DIR/agent-input.md"

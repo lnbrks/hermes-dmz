@@ -1,0 +1,11 @@
+[Unit]
+Description=Run inbox-cleanup fetch on a schedule
+
+[Timer]
+# Twice a day. Adjust to taste.
+OnCalendar=*-*-* 08,20:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

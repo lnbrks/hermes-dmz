@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+Non-AI filter over fetched inbox messages.
+
+Drops:
+- emails already carrying any ai-cleanup/* label (idempotency — agent already acted)
+- emails with ai-cleanup/keep label (user manual override)
+- emails from any sender in excluded-domains (the "leave alone" allowlist)
+
+Applies heuristic decisions (Pass 2 in POLICY.md §3):
+- always-trash sender list → ai-cleanup/trash?
+- always-archive sender + CATEGORY_UPDATES + >7d old → ai-cleanup/archive?
+- calendar invite (subject prefix) + >7d old → ai-cleanup/archive?
+- stale 2FA/verification (subject patterns) + >7d old → ai-cleanup/trash?
+
+Outputs:
+- candidates.ndjson      — what the agent sees
+- heuristic-decisions.json — what apply-labels should apply without LLM
+- pre-filter-summary.md   — context for the agent (counts + samples)
+
+Usage:
+    pre-filter --in inbox.ndjson --run-dir RUN_DIR --config-dir agent/config \\
+        --excluded-domains excluded_domains.txt
+"""
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+EMAIL_RE = re.compile(r"<([^>]+)>")
+LIST_UNSUB_URL_RE = re.compile(r"<([^>]+)>")
+CALENDAR_PREFIXES = (
+    "invitation:", "updated invitation:", "accepted:", "declined:",
+    "canceled event:", "cancelled event:", "tentative:", "document shared with you",
+)
+STALE_2FA_PATTERNS = (
+    "verify your email", "verify your account", "password reset",
+    "sign-in alert", "new sign-in", "new device sign-in", "confirm your email",
+    "one-time", "your code is", "your verification code",
+)
+
+
+def extract_unsubscribe_url(header_value: str) -> str | None:
+    """Parse a List-Unsubscribe header. Prefer https > http > mailto.
+    Returns None if no usable URL is found.
+
+    Format (RFC 8058): `<https://x/u>, <mailto:u@x>` — comma-separated, each
+    in angle brackets. Some senders omit brackets or use bare URLs.
+    """
+    if not header_value:
+        return None
+    urls = LIST_UNSUB_URL_RE.findall(header_value)
+    if not urls:
+        # bare comma-separated form
+        urls = [u.strip() for u in header_value.split(",") if u.strip()]
+    https = [u for u in urls if u.lower().startswith("https:")]
+    if https:
+        return https[0]
+    http = [u for u in urls if u.lower().startswith("http:")]
+    if http:
+        return http[0]
+    mailto = [u for u in urls if u.lower().startswith("mailto:")]
+    if mailto:
+        return mailto[0]
+    return None
+
+
+def parse_sender(from_header: str) -> tuple[str, str]:
+    """Return (name, email_lower)."""
+    if not from_header:
+        return "", ""
+    m = EMAIL_RE.search(from_header)
+    addr = (m.group(1) if m else from_header).strip().lower()
+    name = from_header.split("<")[0].strip().strip('"') if "<" in from_header else from_header
+    return name, addr
+
+
+def domain_of(addr: str) -> str:
+    return addr.split("@", 1)[1] if "@" in addr else ""
+
+
+def load_list(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    out = set()
+    for line in path.read_text().splitlines():
+        s = line.strip().lower()
+        if s and not s.startswith("#"):
+            out.add(s)
+    return out
+
+
+def domain_matches(domain: str, suffixes: set[str]) -> bool:
+    """True if `domain` equals or is a subdomain of any entry in `suffixes`."""
+    if not domain:
+        return False
+    parts = domain.split(".")
+    for i in range(len(parts)):
+        if ".".join(parts[i:]) in suffixes:
+            return True
+    return False
+
+
+def days_old(internal_date_ms: int, now: datetime) -> float:
+    if not internal_date_ms:
+        return 0.0
+    sent = datetime.fromtimestamp(int(internal_date_ms) / 1000, tz=timezone.utc)
+    return (now - sent).total_seconds() / 86400.0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="inp", required=True)
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--config-dir", required=True)
+    ap.add_argument("--excluded-domains", required=True)
+    ap.add_argument("--labels-file", required=True,
+                    help="path to labels.json (name → id map from gws-fetch)")
+    args = ap.parse_args()
+
+    run_dir = Path(args.run_dir)
+    cfg = Path(args.config_dir)
+
+    excluded = load_list(Path(args.excluded_domains))
+    always_trash = load_list(cfg / "always-trash-senders.txt")
+    always_archive = load_list(cfg / "always-archive-senders.txt")
+
+    # Build the set of ai-cleanup/* label IDs. message.labelIds contains opaque
+    # IDs (e.g. "Label_42"), not names, so this lookup is required to
+    # idempotently skip emails the agent has already labeled.
+    label_map: dict[str, str] = json.loads(Path(args.labels_file).read_text())
+    cleanup_ids = {lid for name, lid in label_map.items()
+                   if name.lower().startswith("ai-cleanup/")}
+    user_keep_id = label_map.get("ai-cleanup/keep")
+
+    now = datetime.now(tz=timezone.utc)
+
+    candidates = []
+    decisions = []
+    unsubscribe_urls: dict[str, str] = {}
+    skipped_already_labeled = 0
+    skipped_user_keep = 0
+    skipped_excluded = 0
+    bucket_samples = {"ai-cleanup/trash?": [], "ai-cleanup/archive?": []}
+
+    with open(args.inp) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = json.loads(line)
+            labels = set(m.get("labelIds", []))
+
+            # Idempotency: skip if message carries any ai-cleanup/* label ID.
+            if labels & cleanup_ids:
+                if user_keep_id and user_keep_id in labels:
+                    skipped_user_keep += 1
+                else:
+                    skipped_already_labeled += 1
+                continue
+
+            frm = m.get("headers", {}).get("From", "")
+            _, addr = parse_sender(frm)
+            dom = domain_of(addr)
+
+            if domain_matches(dom, excluded):
+                skipped_excluded += 1
+                continue
+
+            subj = (m.get("headers", {}).get("Subject", "") or "").lower()
+            age = days_old(m.get("internalDate") or 0, now)
+
+            # Heuristic 1: always-trash sender
+            if domain_matches(dom, always_trash):
+                decisions.append({"id": m["id"], "label": "ai-cleanup/trash?",
+                                  "rule": "always-trash-sender", "from": frm,
+                                  "subject": m.get("headers", {}).get("Subject", "")})
+                if len(bucket_samples["ai-cleanup/trash?"]) < 10:
+                    bucket_samples["ai-cleanup/trash?"].append(
+                        f"{frm} — {m.get('headers', {}).get('Subject', '')}")
+                continue
+
+            # Heuristic 2: always-archive sender + CATEGORY_UPDATES + >7d
+            if (domain_matches(dom, always_archive)
+                    and "CATEGORY_UPDATES" in labels
+                    and age > 7):
+                decisions.append({"id": m["id"], "label": "ai-cleanup/archive?",
+                                  "rule": "always-archive-sender-old", "from": frm,
+                                  "subject": m.get("headers", {}).get("Subject", "")})
+                if len(bucket_samples["ai-cleanup/archive?"]) < 10:
+                    bucket_samples["ai-cleanup/archive?"].append(
+                        f"{frm} — {m.get('headers', {}).get('Subject', '')}")
+                continue
+
+            # Heuristic 3: stale calendar invite
+            if any(subj.startswith(p) for p in CALENDAR_PREFIXES) and age > 7:
+                decisions.append({"id": m["id"], "label": "ai-cleanup/archive?",
+                                  "rule": "stale-calendar-invite", "from": frm,
+                                  "subject": m.get("headers", {}).get("Subject", "")})
+                if len(bucket_samples["ai-cleanup/archive?"]) < 10:
+                    bucket_samples["ai-cleanup/archive?"].append(
+                        f"{frm} — {m.get('headers', {}).get('Subject', '')}")
+                continue
+
+            # Heuristic 4: stale 2FA / verification
+            if (any(p in subj for p in STALE_2FA_PATTERNS)
+                    and age > 7
+                    and "unauthorized" not in subj
+                    and "breach" not in subj):
+                decisions.append({"id": m["id"], "label": "ai-cleanup/trash?",
+                                  "rule": "stale-2fa", "from": frm,
+                                  "subject": m.get("headers", {}).get("Subject", "")})
+                if len(bucket_samples["ai-cleanup/trash?"]) < 10:
+                    bucket_samples["ai-cleanup/trash?"].append(
+                        f"{frm} — {m.get('headers', {}).get('Subject', '')}")
+                continue
+
+            # Pre-extract a usable unsubscribe URL (prefer https). The agent
+            # only needs to know whether one exists — the URL itself is just
+            # baggage in its context (some are 1000+ chars of opaque tokens).
+            # So we expose `has_unsubscribe_url` on the candidate and stash
+            # the real URLs in a separate file that only the trusted side
+            # reads (finalize-notification).
+            unsub = extract_unsubscribe_url(
+                m.get("headers", {}).get("List-Unsubscribe", ""))
+            m["has_unsubscribe_url"] = unsub is not None
+            if unsub:
+                unsubscribe_urls[m["id"]] = unsub
+            m.get("headers", {}).pop("List-Unsubscribe", None)
+            m.get("headers", {}).pop("List-Unsubscribe-Post", None)
+            candidates.append(m)
+
+    # Write candidates ndjson (agent input — no URLs, just has_unsubscribe_url)
+    cand_path = run_dir / "candidates.ndjson"
+    with cand_path.open("w") as f:
+        for c in candidates:
+            f.write(json.dumps(c) + "\n")
+
+    # Write the actual URLs to a separate file the trusted side reads.
+    (run_dir / "unsubscribe-urls.json").write_text(
+        json.dumps(unsubscribe_urls, indent=2))
+
+    # Write heuristic decisions
+    dec_path = run_dir / "heuristic-decisions.json"
+    dec_path.write_text(json.dumps({"decisions": decisions}, indent=2))
+
+    # Write summary for the agent
+    summary = [
+        "# Pre-filter summary",
+        "",
+        f"Date: {now.strftime('%Y-%m-%d')}",
+        "",
+        "## Already decided by heuristic (the agent should NOT consider these)",
+        "",
+        f"- {sum(1 for d in decisions if d['label'] == 'ai-cleanup/trash?'):>4} emails: `ai-cleanup/trash?` (rules: always-trash-sender, stale-2fa)",
+        f"- {sum(1 for d in decisions if d['label'] == 'ai-cleanup/archive?'):>4} emails: `ai-cleanup/archive?` (rules: always-archive-sender-old, stale-calendar-invite)",
+        "",
+        "## Skipped (left alone)",
+        "",
+        f"- {skipped_excluded:>4} emails: excluded-domains allowlist (banks, medical, shipping carriers, etc.)",
+        f"- {skipped_already_labeled:>4} emails: already carry a ai-cleanup/* label (prior run)",
+        f"- {skipped_user_keep:>4} emails: user-applied ai-cleanup/keep label",
+        "",
+        f"## What's left for you to classify: **{len(candidates)} emails** (in `candidates.ndjson`)",
+        "",
+    ]
+
+    if bucket_samples["ai-cleanup/trash?"]:
+        summary += ["### Sample heuristic-trashed (for your reference)", ""]
+        for s in bucket_samples["ai-cleanup/trash?"][:5]:
+            summary.append(f"- {s}")
+        summary.append("")
+
+    if bucket_samples["ai-cleanup/archive?"]:
+        summary += ["### Sample heuristic-archived (for your reference)", ""]
+        for s in bucket_samples["ai-cleanup/archive?"][:5]:
+            summary.append(f"- {s}")
+        summary.append("")
+
+    (run_dir / "pre-filter-summary.md").write_text("\n".join(summary))
+
+    print(json.dumps({
+        "candidates": len(candidates),
+        "heuristic_decisions": len(decisions),
+        "skipped_excluded": skipped_excluded,
+        "skipped_already_labeled": skipped_already_labeled,
+        "skipped_user_keep": skipped_user_keep,
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

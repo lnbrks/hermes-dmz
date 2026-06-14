@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+POST a markdown file to an ntfy topic.
+
+Env:
+- NTFY_TOPIC   (required) — the topic name
+- NTFY_SERVER  (default https://ntfy.sh) — server URL (without trailing slash)
+- NTFY_TOKEN   (optional) — bearer token for private topics
+- NTFY_TAGS    (optional) — comma-separated tags
+
+Usage:
+    notify --file RUN_DIR/notification.md [--title "..."]
+"""
+
+import argparse
+import os
+import sys
+import urllib.request
+from pathlib import Path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file", required=True)
+    ap.add_argument("--title", default=None)
+    args = ap.parse_args()
+
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        print("[notify] NTFY_TOPIC not set — skipping notification",
+              file=sys.stderr)
+        return 0
+
+    server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+    body = Path(args.file).read_bytes()
+
+    title = args.title
+    if not title:
+        first = body.splitlines()[0].decode("utf-8", errors="replace").strip()
+        if first.startswith("#"):
+            title = first.lstrip("# ").strip()
+        else:
+            title = "Inbox cleanup run"
+
+    req = urllib.request.Request(
+        f"{server}/{topic}",
+        data=body,
+        method="POST",
+    )
+    req.add_header("Title", title)
+    req.add_header("Markdown", "yes")
+    if tags := os.environ.get("NTFY_TAGS"):
+        req.add_header("Tags", tags)
+    if token := os.environ.get("NTFY_TOKEN"):
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            print(f"[notify] {r.status} {r.reason}", file=sys.stderr)
+    except Exception as e:
+        print(f"[notify] failed: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

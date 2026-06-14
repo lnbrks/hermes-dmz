@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Top-level orchestrator. Run by systemd timer or directly by the user.
+#
+# Steps:
+#   1. mkdir runs/<ts>/
+#   2. gws-fetch        (privileged: reads Gmail)
+#   3. pre-filter       (non-AI, rule-based)
+#   4. volume gate      (bail + notify if N > threshold or if N == 0)
+#   5. agent-run        (sandboxed LLM in bwrap)
+#   6. apply-labels     (privileged: validates allowlist, applies via gws)
+#   7. notify           (POST notification.md to ntfy)
+#
+# Env (from $AGENT_DIR/.env or shell):
+#   ANTHROPIC_API_KEY  (required for agent)
+#   NTFY_TOPIC         (required for notifications)
+#   NTFY_SERVER, NTFY_TOKEN, NTFY_TAGS (optional)
+#   AGENT_MODEL        (default claude-sonnet-4-6)
+#   VOLUME_GATE        (default 300)
+#   FETCH_SINCE_DAYS   (default 14, only used on first run)
+#
+# Flags:
+#   --dry-run          do everything (fetch, pre-filter, agent) except:
+#                      (a) do not advance the high-water mark in last-run.json
+#                      (b) do not apply labels to Gmail
+#                      (c) do not POST to ntfy (notification.md is printed instead)
+#   --max-emails N     cap the fetch to N newest messages (for testing)
+
+set -euo pipefail
+
+DRY_RUN=0
+MAX_EMAILS=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --max-emails) MAX_EMAILS="$2"; shift 2 ;;
+    --max-emails=*) MAX_EMAILS="${1#--max-emails=}"; shift ;;
+    -h|--help)
+      sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+AGENT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$AGENT_DIR/.." && pwd)"
+BIN="$AGENT_DIR/bin"
+PROMPTS="$AGENT_DIR/prompts"
+CONFIG="$AGENT_DIR/config"
+STATE="$AGENT_DIR/state"
+RUNS="$AGENT_DIR/runs"
+EXCLUDED="$REPO_DIR/excluded_domains.txt"
+
+# Load .env if present (repo root takes priority, then agent dir)
+load_env() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  set -a
+  # shellcheck disable=SC1090
+  source "$f"
+  set +a
+}
+load_env "$REPO_DIR/.env"
+load_env "$AGENT_DIR/.env"
+
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY missing (set in .env or env)}"
+
+VOLUME_GATE="${VOLUME_GATE:-300}"
+FETCH_SINCE_DAYS="${FETCH_SINCE_DAYS:-14}"
+
+# RFC 3339 with millisecond precision. Colons are filesystem-legal on Linux;
+# the script always quotes "$RUN_DIR" so shell metachars are not a problem.
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+RUN_DIR="$RUNS/$ts"
+mkdir -p "$RUN_DIR"
+
+# Mirror everything to a per-run log file AND keep it on stdout/stderr.
+# Per-run log makes `ls runs/<ts>/` self-contained for debugging one run;
+# stdout/stderr keeps it visible in the terminal (manual) or journald
+# (systemd, via StandardOutput=journal in the unit).
+exec > >(tee -a "$RUN_DIR/run.log") 2>&1
+
+echo "[cleanup-run] starting at $ts (dry_run=$DRY_RUN)"
+echo "[cleanup-run] run dir: $RUN_DIR"
+
+trap 'echo "[cleanup-run] FAILED at line $LINENO"' ERR
+
+# Promote the run's fetch-max into the durable watermark. Only called after
+# everything that follows the fetch has succeeded. In dry-run we explicitly
+# do NOT advance, so re-runs see the same window of mail.
+promote_watermark() {
+  if (( DRY_RUN )); then
+    echo "[cleanup-run] [dry-run] not advancing $STATE/last-run.json"
+    return 0
+  fi
+  local src="$RUN_DIR/fetch-max.json"
+  [[ -f "$src" ]] || { echo "[cleanup-run] no fetch-max.json; skip promote"; return 0; }
+  local dst="$STATE/last-run.json"
+  local tmp
+  tmp="$(mktemp -p "$STATE" .last-run.XXXXXX)"
+  # Copy fetch-max.json and add a "promoted_at" marker.
+  python3 -c "
+import json, sys, datetime
+d = json.load(open('$src'))
+d['promoted_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+d['promoted_from'] = '$RUN_DIR'
+json.dump(d, open('$tmp', 'w'), indent=2)
+"
+  mv "$tmp" "$dst"
+  echo "[cleanup-run] advanced watermark → $(python3 -c 'import json;print(json.load(open("'$dst'"))["max_internal_date_ms"])')"
+}
+
+# Helpers that honor DRY_RUN.
+do_apply_labels() {
+  local args=(--run-dir "$RUN_DIR")
+  (( DRY_RUN )) && args+=(--dry-run)
+  "$BIN/apply-labels" "${args[@]}"
+}
+do_notify() {
+  local title="${2:-}"
+  if (( DRY_RUN )); then
+    echo "[cleanup-run] [dry-run] would notify (title=${title:-<auto>}):"
+    echo "--- begin notification body ---"
+    cat "$1"
+    echo "--- end notification body ---"
+    return 0
+  fi
+  local args=(--file "$1")
+  [[ -n "$title" ]] && args+=(--title "$title")
+  "$BIN/notify" "${args[@]}" || true
+}
+
+# ── 1. fetch ─────────────────────────────────────────────────────────────
+echo "[cleanup-run] step 1/5: fetch inbox"
+fetch_args=(--out "$RUN_DIR/inbox.ndjson" --state "$STATE" --run-dir "$RUN_DIR" --since-days "$FETCH_SINCE_DAYS")
+(( MAX_EMAILS > 0 )) && fetch_args+=(--max-emails "$MAX_EMAILS")
+"$BIN/gws-fetch" "${fetch_args[@]}"
+
+n_fetched=$(wc -l < "$RUN_DIR/inbox.ndjson" | tr -d ' ')
+echo "[cleanup-run] fetched $n_fetched messages"
+
+# ── 2. pre-filter ────────────────────────────────────────────────────────
+echo "[cleanup-run] step 2/5: pre-filter"
+"$BIN/pre-filter" \
+  --in "$RUN_DIR/inbox.ndjson" \
+  --run-dir "$RUN_DIR" \
+  --config-dir "$CONFIG" \
+  --excluded-domains "$EXCLUDED" \
+  --labels-file "$RUN_DIR/labels.json"
+
+n_candidates=$(wc -l < "$RUN_DIR/candidates.ndjson" | tr -d ' ')
+echo "[cleanup-run] $n_candidates candidates for the agent"
+
+# ── 3. volume gate ───────────────────────────────────────────────────────
+if (( n_candidates == 0 )); then
+  echo "[cleanup-run] no candidates; applying heuristic decisions only"
+  do_apply_labels
+  cat > "$RUN_DIR/notification.md" <<EOF
+# Inbox cleanup: $(date -u +%Y-%m-%d)
+
+No emails needed the agent this run. $(jq -r '.decisions | length' "$RUN_DIR/heuristic-decisions.json" 2>/dev/null || echo 0) handled by pre-filter heuristics.
+EOF
+  do_notify "$RUN_DIR/notification.md" "Inbox cleanup: nothing to triage"
+  promote_watermark
+  echo "[cleanup-run] done (no candidates path)"
+  exit 0
+fi
+
+if (( n_candidates > VOLUME_GATE )); then
+  echo "[cleanup-run] candidate count $n_candidates > gate $VOLUME_GATE; bailing"
+  cat > "$RUN_DIR/notification.md" <<EOF
+# Inbox cleanup: HIGH VOLUME — agent skipped
+
+Pre-filter found **$n_candidates** candidates (gate: $VOLUME_GATE). Agent was not run.
+
+This usually means a marketing wave, a new high-volume sender, or that the
+filter's heuristics are missing something. Look at the inbox manually, or
+re-run with \`VOLUME_GATE=$n_candidates cleanup-run\` to force.
+
+Run dir: \`$RUN_DIR\`
+EOF
+  do_notify "$RUN_DIR/notification.md" "Inbox cleanup: high volume, agent skipped"
+  exit 0
+fi
+
+# ── 4. agent ─────────────────────────────────────────────────────────────
+echo "[cleanup-run] step 3/5: agent (sandboxed)"
+"$BIN/agent-run" "$RUN_DIR" "$PROMPTS"
+
+if [[ ! -f "$RUN_DIR/proposals.json" ]]; then
+  echo "[cleanup-run] agent did not write proposals.json; bailing"
+  cat > "$RUN_DIR/notification.md" <<EOF
+# Inbox cleanup: AGENT FAILED to produce proposals
+
+Run dir: \`$RUN_DIR\`. See \`$RUN_DIR/run.log\` or \`journalctl --user -u cleanup-agent.service\`.
+EOF
+  do_notify "$RUN_DIR/notification.md" "Inbox cleanup: agent failed"
+  exit 1
+fi
+
+# ── 5. apply ─────────────────────────────────────────────────────────────
+echo "[cleanup-run] step 4/5: apply labels"
+do_apply_labels
+
+# Append the canonical unsubscribe-links section to notification.md.
+"$BIN/finalize-notification" --run-dir "$RUN_DIR" || true
+
+# ── 6. notify ────────────────────────────────────────────────────────────
+echo "[cleanup-run] step 5/5: notify"
+if [[ ! -f "$RUN_DIR/notification.md" ]]; then
+  cat > "$RUN_DIR/notification.md" <<EOF
+# Inbox cleanup: $(date -u +%Y-%m-%d)
+
+Run completed but agent did not write a notification. See \`$RUN_DIR/applied.json\`.
+EOF
+fi
+title="$(python3 - "$RUN_DIR" <<'PY'
+import json, sys
+from collections import Counter
+from pathlib import Path
+rd = Path(sys.argv[1])
+c = Counter()
+for f in ("proposals.json", "heuristic-decisions.json"):
+    p = rd / f
+    if not p.exists():
+        continue
+    data = json.loads(p.read_text())
+    items = data.get("proposals") or data.get("decisions") or []
+    for x in items:
+        if (lab := x.get("label")):
+            c[lab] += 1
+trash = c.get("ai-cleanup/trash?", 0)
+arch = c.get("ai-cleanup/archive?", 0)
+unsub = c.get("ai-cleanup/unsubscribe?", 0)
+parts = []
+if arch: parts.append(f"{arch} archive")
+if trash: parts.append(f"{trash} trash")
+if unsub: parts.append(f"{unsub} unsub")
+print("Inbox cleanup: " + (", ".join(parts) if parts else "no proposals"))
+PY
+)"
+do_notify "$RUN_DIR/notification.md" "$title"
+promote_watermark
+
+echo "[cleanup-run] done"

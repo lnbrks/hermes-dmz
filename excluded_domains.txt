@@ -1,0 +1,54 @@
+# Domains excluded from email deletion analysis.
+# These are infrastructure/transactional senders where we never want to delete anything.
+# Add one domain per line; lines starting with # are comments.
+
+# Payments
+paypal.com
+service.paypal.com
+venmo.com
+stripe.com
+
+# Financial
+mail.schwab.com
+email.schwab.com
+mail.fidelity.com
+
+# Shipping carriers
+usps.com
+ups.com
+
+# Airlines (tickets, boarding passes, receipts)
+united.com
+enews.united.com
+info.email.aa.com
+email.alaskaair.com
+
+# Insurance
+correspondence.cigna.com
+notifications.cigna.com
+delivery.cigna.com
+review.cigna.com
+orders.express-scripts.com
+message.delta.org
+
+# Medical / health portals
+ochin.org
+simplepractice.com
+patient-message.com
+
+# Building / housing
+clickpay.com
+virtualservice.net
+myvirtualway.com
+
+# Tax
+intuit.com
+
+# Account security / Google
+accounts.google.com
+
+# Work
+anthropic.com
+
+# Crate & Barrel delivery tracking (transactional subdomain)
+glympse.crateandbarrel.com

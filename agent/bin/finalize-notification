@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""
+Append an "Unsubscribe Links" section to RUN_DIR/notification.md based on
+the agent's ai-cleanup/unsubscribe? proposals and the pre-parsed
+`unsubscribe_url` fields on each candidate. The agent's prompt tells it not
+to write these by hand — this script is the canonical source.
+
+Idempotent: if a `## Unsubscribe Links` section already exists at the end
+of notification.md it is replaced rather than duplicated.
+
+Usage:
+    finalize-notification --run-dir RUN_DIR
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+UNSUB_HEADER = "## Unsubscribe Links"
+EMAIL_RE = re.compile(r"<([^>]+)>")
+
+
+def sender_name(from_header: str) -> str:
+    if not from_header:
+        return "(unknown)"
+    if "<" in from_header:
+        name = from_header.split("<")[0].strip().strip('"')
+        return name or from_header.split("<")[1].rstrip(">").strip()
+    return from_header.strip()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run-dir", required=True)
+    args = ap.parse_args()
+    run_dir = Path(args.run_dir)
+
+    proposals_path = run_dir / "proposals.json"
+    candidates_path = run_dir / "candidates.ndjson"
+    urls_path = run_dir / "unsubscribe-urls.json"
+    notif_path = run_dir / "notification.md"
+
+    if not (proposals_path.exists() and candidates_path.exists()
+            and notif_path.exists()):
+        print("[finalize-notification] missing inputs; skipping",
+              file=sys.stderr)
+        return 0
+
+    proposals = json.loads(proposals_path.read_text()).get("proposals", [])
+    unsub_ids = {p["id"] for p in proposals
+                 if p.get("label") == "ai-cleanup/unsubscribe?"}
+    if not unsub_ids:
+        return 0
+
+    # URLs live in a separate file the agent never sees.
+    urls_by_id = json.loads(urls_path.read_text()) if urls_path.exists() else {}
+
+    # Look up sender metadata for each unsub'd id in candidates.ndjson.
+    candidates = {}
+    with candidates_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = json.loads(line)
+            if m["id"] in unsub_ids:
+                candidates[m["id"]] = m
+
+    # Group by sender so duplicate emails from one sender collapse.
+    by_sender: dict[str, dict] = {}
+    for mid in unsub_ids:
+        m = candidates.get(mid)
+        if not m:
+            continue
+        frm = m.get("headers", {}).get("From", "")
+        url = urls_by_id.get(mid)
+        key = frm.lower() or mid
+        if key not in by_sender:
+            by_sender[key] = {
+                "name": sender_name(frm),
+                "from": frm,
+                "url": url,
+                "count": 0,
+                "no_url": url is None,
+            }
+        # Prefer the first https URL we saw; only overwrite if we still don't have one.
+        if not by_sender[key]["url"] and url:
+            by_sender[key]["url"] = url
+            by_sender[key]["no_url"] = False
+        by_sender[key]["count"] += 1
+
+    lines = [UNSUB_HEADER, ""]
+    have_url = [s for s in by_sender.values() if s["url"] and not s["url"].lower().startswith("mailto:")]
+    mailto_only = [s for s in by_sender.values() if s["url"] and s["url"].lower().startswith("mailto:")]
+    no_url = [s for s in by_sender.values() if not s["url"]]
+
+    for s in sorted(have_url, key=lambda x: (-x["count"], x["name"].lower())):
+        n = f" ({s['count']})" if s["count"] > 1 else ""
+        lines.append(f"- [{s['name']}{n}](<{s['url']}>)")
+    for s in sorted(mailto_only, key=lambda x: x["name"].lower()):
+        # mailto: links are real links — many phone email clients honor them.
+        # Use angle-bracket URL form so subject/body query params (which
+        # often contain & ? = and other markdown-fragile chars) parse cleanly.
+        lines.append(f"- [{s['name']}](<{s['url']}>) *(email unsubscribe)*")
+    for s in sorted(no_url, key=lambda x: x["name"].lower()):
+        lines.append(f"- {s['name']} — no List-Unsubscribe header; unsubscribe manually")
+    lines.append("")
+
+    body = notif_path.read_text()
+    # Idempotent: strip any prior auto-appended section.
+    idx = body.rfind(UNSUB_HEADER)
+    if idx != -1:
+        body = body[:idx].rstrip() + "\n\n"
+    else:
+        if not body.endswith("\n"):
+            body += "\n"
+        body += "\n---\n\n"
+    body += "\n".join(lines)
+    notif_path.write_text(body)
+    print(f"[finalize-notification] appended {len(by_sender)} unsubscribe entries",
+          file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

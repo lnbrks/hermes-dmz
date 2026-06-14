@@ -1,0 +1,54 @@
+# Hermes config for the inbox-cleanup agent.
+#
+# Secrets come from deploy/.env via the container environment
+# (OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS,
+# WEBHOOK_SECRET) — do NOT put them here.
+#
+# Schema note: this targets the documented Hermes config keys. Diff against
+# `~/.hermes/config.yaml` produced by `hermes setup` on the pinned image and
+# adjust any key the installed version renamed.
+
+# Model via OpenRouter (key is the sandbox dummy; the gateway swaps in the real
+# one). Any OpenRouter slug works here.
+model:
+  default: "deepseek/deepseek-v4-pro"
+  provider: "openrouter"
+  base_url: "https://openrouter.ai/api/v1"
+
+terminal:
+  backend: local        # the agent runs gws + skill scripts inside THIS container
+
+platforms:
+  telegram:
+    enabled: true
+    extra:
+      require_mention: false
+      reactions: true
+
+  webhook:
+    enabled: true
+    extra:
+      port: 8644
+      # Per-route secret falls back to the global WEBHOOK_SECRET env var.
+      routes:
+        inbox-cleanup:
+          prompt: |
+            A new inbox-cleanup batch is ready.
+            Batch dir: {path}
+            Candidates to classify: {candidates}
+            Already pre-decided by heuristics: {heuristics}
+
+            Use the `inbox-cleanup` skill. Classify the candidates, apply the
+            pre-decided heuristic labels and your own ai-cleanup/* labels via
+            gws, commit the cursor, then post a short summary to this chat.
+          deliver: telegram
+          # No chat_id: delivery falls back to TELEGRAM_HOME_CHANNEL (set to
+          # TELEGRAM_CHAT_ID in compose) — your DM.
+
+# Narrow the agent's tools per platform. It needs a shell (terminal → gws +
+# skill scripts), files, skills, and memory/recall. Deliberately NO web/browser
+# — the gateway denies those hosts anyway, and a smaller surface is safer.
+# `webhook` is our trigger path; `telegram` covers interactive DMs.
+platform_toolsets:
+  webhook:  [terminal, file, skills, memory, session_search, todo]
+  telegram: [terminal, file, skills, memory, session_search, todo]

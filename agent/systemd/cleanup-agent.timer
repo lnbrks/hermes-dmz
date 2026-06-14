@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily inbox cleanup agent run
+Documentation=file:///home/ilana/src/ai-inbox-cleanup/POLICY.md
+
+[Timer]
+# Fire daily at 07:00 local time. If the system was off, run when it comes up.
+OnCalendar=*-*-* 07:00:00
+Persistent=yes
+RandomizedDelaySec=15min
+Unit=cleanup-agent.service
+
+[Install]
+WantedBy=timers.target

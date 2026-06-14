@@ -1,0 +1,4 @@
+# mitmproxy itself is provided by the base image (mitmproxy/mitmproxy).
+# These are the extra deps our addons need.
+PyYAML>=6.0
+httpx>=0.27

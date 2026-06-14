@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+**/.env
+/deploy/state/
+/host/gws_secrets/
+
+# Private email data + v1 runtime outputs — never commit
+/manual-pass/
+/agent/runs/
+/agent/state/
+
+# Python
+__pycache__/
+*.pyc

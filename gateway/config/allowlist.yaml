@@ -1,0 +1,38 @@
+# Gateway egress allowlist — deny-by-default.
+#
+# Any host NOT listed here is rejected by the generic `egress` addon with a
+# 403 before any other policy runs. This is the network choke point for the
+# Hermes container, which has no other route to the internet.
+#
+# mode:
+#   google        — Gmail policy module: read = allow, mutations restricted to
+#                   the ai-cleanup/* label namespace, real OAuth token injected.
+#   google_oauth  — the OAuth token endpoint. The gateway answers /token itself
+#                   with a synthetic access token so the sandbox never needs
+#                   real credentials.
+#   openrouter    — model endpoint allowlist + real API-key injection (the
+#                   sandbox holds only a dummy key).
+#   telegram      — bot-token injection + method/chat_id allowlist (the sandbox
+#                   holds only a dummy token; sends are pinned to allowed chats).
+#   passthrough   — allow as-is; inject nothing, validate nothing. (No host
+#                   uses this now — every external host gets a real policy.)
+#
+# Decisions are keyed on the DIAL TARGET (server_conn.address), not the Host
+# header. To add a capability (e.g. Calendar), add its host with mode: google.
+
+hosts:
+  # ── Model provider (Hermes core → LLM) ──────────────────────────────────
+  openrouter.ai:
+    mode: openrouter
+
+  # ── Delivery (Hermes messaging gateway → Telegram) ──────────────────────
+  api.telegram.org:
+    mode: telegram
+
+  # ── Google Workspace (agent's gws tool) ─────────────────────────────────
+  gmail.googleapis.com:
+    mode: google
+  www.googleapis.com:
+    mode: google
+  oauth2.googleapis.com:
+    mode: google_oauth
