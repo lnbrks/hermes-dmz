@@ -17,6 +17,29 @@ cursor. You **never delete or archive mail directly** — you only apply
 enforces this: any attempt to touch a non-`ai-cleanup/*` label is rejected at
 the wire, so you cannot mutate inbox state even by accident.
 
+## Webhook invocation — no live conversation
+
+This skill is almost always triggered by a webhook, not by a user chatting
+with you interactively. The webhook drops a batch directory and asks you to
+process it — there is nobody waiting on the other end to answer questions.
+
+This means:
+
+- **Execute autonomously.** Run the full workflow (classify → apply labels →
+  commit cursor) without waiting for confirmation or approval at each step.
+- **Your final response IS the delivery.** That last message will be shown to
+  the user. It must be a complete, self-contained summary of everything you
+  did — what you classified, what labels were applied, whether the cursor was
+  committed, and anything the user should look at. There is no separate
+  "post to chat" step; your response *is* the post.
+- **Don't wait on questions.** If you're unsure about a classification, make
+  your best call, flag it in the summary under "Worth a look" or "Questions,"
+  and move on. Do not halt the workflow or leave the batch uncommitted waiting
+  for an answer that won't arrive until the user reads the summary later.
+- **Your summary is your only deliverable.** If the user wants to correct a
+  decision or teach you a new rule, they'll reply in chat after seeing it.
+  Save that correction to memory then.
+
 ## The batch directory
 
 The webhook gives you the batch path (e.g. `/opt/data/work/batches/<ts>`). In it:

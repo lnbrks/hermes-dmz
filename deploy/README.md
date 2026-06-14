@@ -68,11 +68,20 @@ chmod 600 state/secrets/gws-creds.json
 #    TELEGRAM_ALLOWED_USERS). Delivery uses TELEGRAM_HOME_CHANNEL, so no
 #    chat id needs to go in hermes/config.yaml.
 
-# 3. Build + start. The gateway generates its CA on first boot; the healthcheck
+# 3. Disable Hermes' 73 bundled skills (we only want inbox-cleanup). The marker
+#    lives in the persistent state dir, so it sticks across restarts.
+mkdir -p state/hermes && touch state/hermes/.no-bundled-skills
+
+# 4. Build + start. The gateway generates its CA on first boot; the healthcheck
 #    blocks hermes until the CA exists, so hermes always trusts the proxy.
 docker compose up -d --build
 docker compose logs -f hermes     # watch it come up
 ```
+
+The skill dir `hermes/skills/` is bind-mounted **read-write**, so the agent
+edits `inbox-cleanup` (and writes any new skills it authors) straight into the
+repo, persisted across restarts. Agent-authored skills show up as untracked
+files under `hermes/skills/` — commit or discard as you like.
 
 ## Test the gateway alone (no creds, no hermes)
 

@@ -12,3 +12,7 @@
 # Python
 __pycache__/
 *.pyc
+
+# Hermes runtime artifacts written into the bind-mounted skills dir
+/hermes/skills/.usage.json
+/hermes/skills/.usage.json.lock

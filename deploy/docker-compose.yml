@@ -74,11 +74,15 @@ services:
     # No published ports: an internal-only network can't publish them. The host
     # reaches the webhook via the container's internal IP (see host/fetch-and-trigger).
     volumes:
-      - ./state/hermes:/opt/data:z            # hermes state (config, sessions, memory, skills)
+      - ./state/hermes:/opt/data:z            # hermes state (config, sessions, memory)
       - ./../hermes/config.yaml:/opt/data/config.yaml:ro,z
-      # Our skill is SEEDED into state/hermes/skills (not nested-mounted — a
-      # nested bind mount makes /opt/data/skills root-owned and unwritable).
-      # Skills live in the rw data volume; the agent can create/modify them.
+      # Skills dir bind-mounted READ-WRITE from the repo: the agent edits the
+      # skill in place (persists across restarts) and writes any new skills it
+      # authors straight back here. Mounting the WHOLE dir (not a nested single
+      # skill) keeps /opt/data/skills owned by the container user. Bundled skills
+      # are disabled via the .no-bundled-skills marker in state/hermes, so this
+      # dir stays clean — just our skill + whatever the agent creates.
+      - ./../hermes/skills:/opt/data/skills:z
       - ./state/work:/opt/data/work:z         # batch handoff + cursor (host writes, agent reads/writes)
       - mitm-ca:/opt/mitm-ca:ro               # the gateway's CA, to trust the MITM (named volume)
       - ${GWS_BIN:-/home/ilana/.cargo/bin/gws}:/usr/local/bin/gws:ro,z
